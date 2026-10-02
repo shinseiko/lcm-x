@@ -6,6 +6,11 @@ including the `v1.0.0-beta.*` prereleases, have none. GitHub Releases are publis
 
 ## Unreleased
 
+- Install (Windows): `scripts/install.ps1` is a PowerShell 7.2+ workalike of `install.sh`. It resolves the Hermes
+  home the way Hermes does (`HERMES_HOME`, else `%LOCALAPPDATA%\hermes`), keeps the same preflight, refusals, and
+  activation/migration output, and links with symbolic links, falling back to directory junctions when symbolic
+  links are not permitted. It never edits `config.yaml` or deletes anything.
+
 ## v0.24.9 - (unreleased; rc4) (drain: one foreground time budget, stub-first exit, exit fit, scan allowance)
 
 - Fix: with semantic embeddings enabled and the provider package missing or misconfigured, `lcm_doctor` and

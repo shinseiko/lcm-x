@@ -12,7 +12,7 @@ git clone https://github.com/electricsheephq/lcm-x \
   ~/.hermes/plugins/hermes-lcm-x
 ```
 
-For profile-specific installs, clone under `~/.hermes/profiles/<profile>/plugins/hermes-lcm-x`. For development checkouts, `scripts/install.sh` creates a profile-aware symlink into the active Hermes plugin directory and refuses to overwrite an existing checkout or unrelated symlink.
+For profile-specific installs, clone under `~/.hermes/profiles/<profile>/plugins/hermes-lcm-x`. For development checkouts, `scripts/install.sh` creates a profile-aware symlink into the active Hermes plugin directory and refuses to overwrite an existing checkout or unrelated symlink. On Windows, `scripts\install.ps1` (PowerShell 7.2+) does the same against `%LOCALAPPDATA%\hermes` (or `HERMES_HOME`), using symbolic links or, where those are not permitted, directory junctions.
 
 ## Why not pip-style packaging yet?
 

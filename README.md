@@ -205,7 +205,29 @@ From an existing checkout, install a symlink:
 HERMES_PROFILE=myprofile ./scripts/install.sh
 ```
 
-Run `scripts/install.sh` even when the checkout already lives at the canonical
+On Windows, use PowerShell 7.2 or newer (`pwsh`) and `scripts\install.ps1`. Hermes' home
+there is `%LOCALAPPDATA%\hermes` unless `HERMES_HOME` is set:
+
+```powershell
+git clone https://github.com/electricsheephq/lcm-x "$env:LOCALAPPDATA\hermes\plugins\hermes-lcm-x"
+
+# Or, from an existing checkout:
+.\scripts\install.ps1
+
+# Optional profile-aware install:
+.\scripts\install.ps1 -HermesProfile myprofile
+```
+
+`install.ps1` does what `install.sh` does: the same preflight, the same refusals and
+migration output, and it never edits `config.yaml` or deletes anything. It creates
+symbolic links, and falls back to directory junctions when symbolic links are not
+permitted (turn on Windows Developer Mode to allow them); Hermes follows both. It
+also accepts `-HermesHome <full path>` and `-LinkType Auto|SymbolicLink|Junction`.
+`HERMES_HOME` may use `~`, `$VAR`, `${VAR}` or `%VAR%` as Hermes does, but a relative or
+half-expanded path is refused, and a profile must be a valid Hermes profile name
+(lowercase letters, digits, `_` and `-`).
+
+Run `scripts/install.sh` (or `scripts\install.ps1`) even when the checkout already lives at the canonical
 plugin path. It leaves that checkout in place and exposes the bundled
 `hermes-lcm` skill in the matching global/profile `skills/` directory. The
 installer preflights both paths and refuses conflicts before creating links.

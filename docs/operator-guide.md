@@ -35,6 +35,19 @@ From an existing checkout, install a symlink:
 HERMES_PROFILE=myprofile ./scripts/install.sh
 ```
 
+On Windows, run the PowerShell 7.2+ port from the checkout. Hermes' home is
+`%LOCALAPPDATA%\hermes` unless `HERMES_HOME` is set:
+
+```powershell
+.\scripts\install.ps1
+# Optional profile-aware install:
+.\scripts\install.ps1 -HermesProfile myprofile
+```
+
+`install.ps1` links with symbolic links and falls back to directory junctions when
+symbolic links are not permitted (Windows Developer Mode allows them); Hermes follows
+both. It has the same preflight, refusals, and migration output as `install.sh`.
+
 The installer exposes both the plugin checkout and the bundled
 `skills/hermes-lcm` package in the matching global/profile skill tree. It is
 safe to run from a checkout already cloned into the canonical plugin path and

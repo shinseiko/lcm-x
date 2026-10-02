@@ -36,6 +36,14 @@ An existing checkout can install profile-aware plugin and skill links:
 HERMES_PROFILE=myprofile ./scripts/install.sh
 ```
 
+On Windows (PowerShell 7.2+), use the equivalent `install.ps1`; Hermes' home is
+`%LOCALAPPDATA%\hermes` unless `HERMES_HOME` is set:
+
+```powershell
+.\scripts\install.ps1
+.\scripts\install.ps1 -HermesProfile myprofile
+```
+
 The installer exposes both:
 
 - `plugins/hermes-lcm-x` for plugin loading;
