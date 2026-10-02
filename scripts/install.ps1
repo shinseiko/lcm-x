@@ -223,10 +223,12 @@ function Assert-LinkTargetFree {
 }
 
 function New-DirectoryLink {
-    # Creates $Path as a link to $Target and returns what happened (Created, Kind, ...).
-    # The link is made under a fresh sibling name and then renamed onto $Path. The rename fails
-    # if anything appeared at $Path meanwhile, so nothing there is ever replaced. (New-Item
-    # -ItemType Junction on its own silently replaces an existing empty directory.)
+    # Creates $Path as a link to $Target and returns what happened (Created, Kind, ...), never
+    # replacing anything that appeared at $Path after the preflight. New-Item -ItemType
+    # SymbolicLink already refuses an existing path. New-Item -ItemType Junction silently
+    # replaces an empty directory, so a junction is made under a fresh sibling name and renamed
+    # onto $Path; on Windows that rename fails if anything exists there. (Junctions are
+    # Windows-only, so the rename never relies on POSIX rename semantics.)
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -244,11 +246,16 @@ function New-DirectoryLink {
     $failures = [System.Collections.Generic.List[string]]::new()
     $symlinkFailure = $null
     foreach ($kind in $attempts) {
-        $staging = '{0}.install-{1}' -f $Path, [guid]::NewGuid().ToString('N').Substring(0, 12)
+        $createAt = if ($kind -eq 'Junction') {
+            '{0}.install-{1}' -f $Path, [guid]::NewGuid().ToString('N').Substring(0, 12)
+        }
+        else {
+            $Path
+        }
         try {
             $newItem = @{
                 ItemType = $kind
-                Path = $staging
+                Path = $createAt
                 Target = $Target
                 ErrorAction = 'Stop'
                 WhatIf = $false
@@ -258,18 +265,27 @@ function New-DirectoryLink {
         }
         catch {
             $failures.Add("${kind}: $($_.Exception.Message)")
+            # Something appeared at $Path: another link kind would not change that.
+            if (Test-PathOrLink $Path) { break }
             if ($kind -eq 'SymbolicLink') { $symlinkFailure = $_.Exception.Message }
             continue
         }
-        try {
-            [IO.Directory]::Move($staging, $Path)
-        }
-        catch {
-            # Something now exists at $Path. Remove only our own link (never recursively) and
-            # stop: falling back to another link kind would not change that.
-            [IO.Directory]::Delete($staging, $false)
-            $failures.Add("${Path}: $($_.Exception.Message)")
-            break
+        if ($createAt -ne $Path) {
+            try {
+                [IO.Directory]::Move($createAt, $Path)
+            }
+            catch {
+                # Something now exists at $Path. Remove only our own link, never recursively.
+                $failures.Add("${Path}: $($_.Exception.Message)")
+                try {
+                    [IO.Directory]::Delete($createAt, $false)
+                }
+                catch {
+                    $failures.Add("The temporary link $createAt is left in place; remove it by hand:" +
+                        " $($_.Exception.Message)")
+                }
+                break
+            }
         }
         return [pscustomobject]@{
             Path = $Path

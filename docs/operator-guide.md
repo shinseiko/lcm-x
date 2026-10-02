@@ -80,7 +80,7 @@ Intentional differences from `install.sh`:
 | Refusal noun | `symlink` | `symlink` or `junction`, whichever it is | Names the actual link |
 | Path identity | exact string compare after `pwd -P` | every link and junction resolved, case-insensitive | Windows paths are case-insensitive |
 | Unreadable `config.yaml` | `grep:` error, install continues | `install.ps1:` error plus a pointer to the migration steps, install continues | Same behavior; the message comes from a different tool |
-| Link creation | `ln -s` | link made under a temporary sibling name, then renamed into place | Never replaces anything that appears at the target meanwhile |
+| Link creation | `ln -s` | symlink created directly; a junction is made under a temporary sibling name, then renamed into place | `New-Item` replaces an empty directory with a junction; this never replaces anything that appears at the target meanwhile |
 | Extras | none | `-WhatIf`/`-Confirm` (declining any step exits 1 and lists what was and was not created), `-LinkType`, `Get-Help`; refuses a checkout without its bundled skill; re-checks both links after creating them | PowerShell conventions and additive safety checks |
 | Runtime | bash | PowerShell 7.2+ | `ResolveLinkTarget` needs .NET 6 |
 

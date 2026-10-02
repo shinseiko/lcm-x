@@ -607,18 +607,22 @@ def test_install_expands_dollar_style_variables_like_hermes_does(tmp_path, herme
 
 
 FALLBACK_HARNESS = r"""
-param([string]$ScriptPath, [string]$Link, [string]$Target, [string]$LinkType)
+param([string]$ScriptPath, [string]$Link, [string]$Target, [string]$LinkType, [switch]$NoSymlinkPrivilege)
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($ScriptPath, [ref]$null, [ref]$null)
-$fn = $ast.Find({
-    param($n)
-    $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'New-DirectoryLink'
-}, $true)
-Invoke-Expression $fn.Extent.Text
+foreach ($name in 'Get-ItemOrNull', 'Test-PathOrLink', 'New-DirectoryLink') {
+    $fn = $ast.Find({
+        param($n)
+        $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name
+    }, $true)
+    Invoke-Expression $fn.Extent.Text
+}
 function Exit-Install { param([string[]]$Message) throw ($Message -join '; ') }
 function New-Item {
     [CmdletBinding(SupportsShouldProcess)]
     param($ItemType, $Path, $Target)
-    if ($ItemType -eq 'SymbolicLink') { throw 'simulated: symbolic links are not permitted' }
+    if ($NoSymlinkPrivilege -and $ItemType -eq 'SymbolicLink') {
+        throw 'simulated: symbolic links are not permitted'
+    }
     Microsoft.PowerShell.Management\New-Item -ItemType $ItemType -Path $Path -Value $Target -ErrorAction Stop
 }
 $result = New-DirectoryLink -Path $Link -Target $Target -LinkType $LinkType -Confirm:$false
@@ -630,7 +634,9 @@ $result = New-DirectoryLink -Path $Link -Target $Target -LinkType $LinkType -Con
 """
 
 
-def _run_fallback_harness(tmp_path: Path, link_type: str, existing_empty_dir: bool = False):
+def _run_fallback_harness(
+    tmp_path: Path, link_type: str, existing_empty_dir: bool = False, symlink_privilege: bool = False
+):
     harness = tmp_path / "harness.ps1"
     harness.write_text(FALLBACK_HARNESS, encoding="utf-8")
     target = tmp_path / "target"
@@ -638,9 +644,11 @@ def _run_fallback_harness(tmp_path: Path, link_type: str, existing_empty_dir: bo
     link = tmp_path / "link"
     if existing_empty_dir:
         link.mkdir()
+    privilege = [] if symlink_privilege else ["-NoSymlinkPrivilege"]
     result = subprocess.run(
         [PWSH, "-NoProfile", "-NonInteractive", "-File", str(harness),
-         "-ScriptPath", str(INSTALL_PS1), "-Link", str(link), "-Target", str(target), "-LinkType", link_type],
+         "-ScriptPath", str(INSTALL_PS1), "-Link", str(link), "-Target", str(target), "-LinkType", link_type,
+         *privilege],
         check=False, capture_output=True, text=True, encoding="utf-8", env=_clean_env(),
     )
     return result, link, target
@@ -678,20 +686,44 @@ def test_forced_symbolic_link_does_not_fall_back(tmp_path):
 
 
 @windows_pwsh_only
-@pytest.mark.parametrize("link_type", ["Auto", "Junction"])
-def test_link_creation_never_replaces_an_empty_directory_that_appeared(tmp_path, link_type):
+@pytest.mark.parametrize(
+    ("link_type", "symlink_privilege"),
+    [("Auto", False), ("Junction", False), ("Auto", True), ("SymbolicLink", True)],
+    ids=["auto-no-privilege", "junction", "auto-with-privilege", "symbolic-link"],
+)
+def test_link_creation_never_replaces_an_empty_directory_that_appeared(tmp_path, link_type, symlink_privilege):
     # New-Item -ItemType Junction silently replaces an empty directory. A directory that appears
-    # after the preflight (another process, a second installer) must survive untouched.
+    # after the preflight (another process, a second installer) must survive untouched, whichever
+    # link kind is tried, and a symlink refusal must not fall back to a junction over it.
+    if symlink_privilege and not _symlinks_allowed(tmp_path):
+        pytest.skip("symbolic links are not permitted here")
     try:
-        result, link, _ = _run_fallback_harness(tmp_path, link_type, existing_empty_dir=True)
+        result, link, _ = _run_fallback_harness(
+            tmp_path, link_type, existing_empty_dir=True, symlink_privilege=symlink_privilege
+        )
 
         assert result.returncode == 0, result.stderr
         assert "CREATED=False" in result.stdout
         assert link.is_dir() and not _is_link(link)
         leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith("link.install-")]
         assert leftovers == [], "the staging link must be removed"
+        if symlink_privilege:
+            assert "Junction" not in result.stdout.split("FAILURES=", 1)[1], "no junction fallback over it"
     finally:
         _remove_links(tmp_path)
+
+
+def _symlinks_allowed(tmp_path: Path) -> bool:
+    probe_target = tmp_path / "probe-target"
+    probe_target.mkdir()
+    try:
+        os.symlink(probe_target, tmp_path / "probe-link", target_is_directory=True)
+        os.rmdir(tmp_path / "probe-link")
+        return True
+    except OSError:
+        return False
+    finally:
+        probe_target.rmdir()
 
 
 @windows_pwsh_only
@@ -752,8 +784,9 @@ def test_confirm_declining_the_links_reports_what_was_created(hermes_home):
     result = _install_confirm(hermes_home, "y\ny\nn\nn\n")
 
     assert result.returncode == 1
-    assert "Created before cancelling and left in place:" in result.stderr
-    assert str(hermes_home / "plugins") in result.stderr
+    lines = result.stderr.splitlines()
+    created = lines[lines.index("Created before cancelling and left in place:") + 1:]
+    assert created == [f"  {hermes_home / 'plugins'}", f"  {hermes_home / 'skills'}"]
     assert not (hermes_home / "plugins" / "hermes-lcm-x").exists()
     assert "Installed hermes-lcm-x" not in result.stdout
 

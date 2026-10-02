@@ -302,21 +302,19 @@ def _normalize(text: str, root: Path) -> str:
     return re.sub(r"\binstall\.(?:sh|ps1)\b", "<installer>", text)  # script name
 
 
+_MAX_SYMLINK_PATH = 240  # MAX_PATH (260) less room for the longest name created under it
+
+
 @pytest.fixture
 def roots(tmp_path):
     # Resolved, so %TEMP%'s 8.3 short name does not make the two scripts print different spellings.
     base = tmp_path.resolve()
-    # Symlinks fail on long paths (MAX_PATH) even with the privilege, and install.ps1 would then
-    # fall back to a junction by design. Probe at the deepest path a scenario uses.
-    probe = base / "ps1" / "home" / "profiles" / "work" / "plugins" / "hermes-lcm-x.install-000000000000"
-    probe.parent.mkdir(parents=True)
-    try:
-        os.symlink(base, probe, target_is_directory=True)
-        os.rmdir(probe)
-    except OSError as exc:
-        pytest.skip(f"cannot create a symlink at this path length ({len(str(probe))}): {exc}")
-    finally:
-        shutil.rmtree(base / "ps1")
+    # PowerShell's New-Item cannot create a symlink past MAX_PATH even with the privilege (Python's
+    # os.symlink can, so it is no probe), and install.ps1 would then fall back to a junction by
+    # design. Skip rather than report that as a parity failure.
+    deepest = base / "ps1" / "home" / "profiles" / "work" / "plugins" / "hermes-lcm-x"
+    if len(str(deepest)) >= _MAX_SYMLINK_PATH:
+        pytest.skip(f"paths would reach {len(str(deepest))} characters; use a shorter --basetemp")
     yield base / "sh", base / "ps1"
     _remove_links(tmp_path)
 
