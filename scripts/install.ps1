@@ -92,19 +92,40 @@ function Exit-Install {
     exit 1
 }
 
+function Get-ItemOrNull {
+    # Get-Item that answers "nothing there" only when nothing is there. Any other failure
+    # (access denied, I/O error) still stops the script instead of reading as "absent".
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        return Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    }
+    catch [System.Management.Automation.ItemNotFoundException] {
+        return $null
+    }
+}
+
+function Test-IsLink {
+    # A symlink or junction. A hard-linked file also reports a LinkType, but it is just a file,
+    # as it is to install.sh's [[ -L ]].
+    param([System.IO.FileSystemInfo]$Item)
+    return [bool]($Item -and $Item.LinkType -in 'SymbolicLink', 'Junction')
+}
+
 function Get-PhysicalPath {
     # Equivalent of `cd <path> && pwd -P`: resolves every link and junction on the way,
     # not just the last component, so two spellings of one directory compare equal.
     param([Parameter(Mandatory)][string]$Path, [int]$Depth = 0)
     if ($Depth -gt 32) { throw "Too many levels of links while resolving: $Path" }
-    $full = [IO.Path]::GetFullPath($Path, (Get-Location).ProviderPath)
+    # The file-system location, so running from HKCU:\ or another provider still works.
+    $workingDirectory = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath
+    $full = [IO.Path]::GetFullPath($Path, $workingDirectory)
     $root = [IO.Path]::GetPathRoot($full)
     $parts = $full.Substring($root.Length).Split($PathSeparators, [StringSplitOptions]::RemoveEmptyEntries)
     $current = $root
     foreach ($part in $parts) {
         $current = Join-Path -Path $current -ChildPath $part
-        $item = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
-        if ($item -and $item.LinkType) {
+        $item = Get-ItemOrNull -Path $current
+        if (Test-IsLink $item) {
             $destination = $item.ResolveLinkTarget($false)
             if ($destination) { $current = Get-PhysicalPath -Path $destination.FullName -Depth ($Depth + 1) }
         }
@@ -120,7 +141,7 @@ function Test-SamePath {
 function Test-PathOrLink {
     # Like `-e || -L`: true for a dangling link too, which Test-Path can miss.
     param([Parameter(Mandatory)][string]$Path)
-    return [bool](Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue)
+    return [bool](Get-ItemOrNull -Path $Path)
 }
 
 function Get-DefaultHermesHome {
@@ -172,11 +193,11 @@ function Assert-LinkTargetFree {
         [Parameter(Mandatory)][string]$Target,
         [Parameter(Mandatory)][string]$Expected
     )
-    $item = Get-Item -LiteralPath $Target -Force -ErrorAction SilentlyContinue
+    $item = Get-ItemOrNull -Path $Target
     if (-not $item) { return }
 
     $prefix = if ($Label -eq 'plugin') { '' } else { 'skill ' }
-    if ($item.LinkType) {
+    if (Test-IsLink $item) {
         # Like install.sh: the canonical path when the link resolves, else the raw link text.
         $current = if (Test-Path -LiteralPath $Target) {
             Get-PhysicalPath -Path $Target
@@ -202,14 +223,19 @@ function Assert-LinkTargetFree {
 }
 
 function New-DirectoryLink {
-    # Creates $Path as a link to $Target. Returns what was made, or nothing under -WhatIf.
+    # Creates $Path as a link to $Target and returns what happened (Created, Kind, ...).
+    # The link is made under a fresh sibling name and then renamed onto $Path. The rename fails
+    # if anything appeared at $Path meanwhile, so nothing there is ever replaced. (New-Item
+    # -ItemType Junction on its own silently replaces an existing empty directory.)
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][string]$Target,
         [Parameter(Mandatory)][ValidateSet('Auto', 'SymbolicLink', 'Junction')][string]$LinkType
     )
-    if (-not $PSCmdlet.ShouldProcess($Path, "Create link to $Target")) { return }
+    if (-not $PSCmdlet.ShouldProcess($Path, "Create link to $Target")) {
+        return [pscustomobject]@{ Path = $Path; Created = $false; Declined = $true; Failures = @() }
+    }
 
     $attempts = switch ($LinkType) {
         'Auto' { if ($IsWindows) { 'SymbolicLink', 'Junction' } else { , 'SymbolicLink' } }
@@ -218,37 +244,61 @@ function New-DirectoryLink {
     $failures = [System.Collections.Generic.List[string]]::new()
     $symlinkFailure = $null
     foreach ($kind in $attempts) {
+        $staging = '{0}.install-{1}' -f $Path, [guid]::NewGuid().ToString('N').Substring(0, 12)
         try {
             $newItem = @{
                 ItemType = $kind
-                Path = $Path
+                Path = $staging
                 Target = $Target
                 ErrorAction = 'Stop'
                 WhatIf = $false
                 Confirm = $false
             }
             New-Item @newItem | Out-Null
-            return [pscustomobject]@{
-                Path = $Path
-                Kind = $kind
-                UsedFallback = ($kind -eq 'Junction' -and $LinkType -eq 'Auto')
-                SymlinkFailure = $symlinkFailure
-            }
         }
         catch {
             $failures.Add("${kind}: $($_.Exception.Message)")
             if ($kind -eq 'SymbolicLink') { $symlinkFailure = $_.Exception.Message }
+            continue
+        }
+        try {
+            [IO.Directory]::Move($staging, $Path)
+        }
+        catch {
+            # Something now exists at $Path. Remove only our own link (never recursively) and
+            # stop: falling back to another link kind would not change that.
+            [IO.Directory]::Delete($staging, $false)
+            $failures.Add("${Path}: $($_.Exception.Message)")
+            break
+        }
+        return [pscustomobject]@{
+            Path = $Path
+            Created = $true
+            Declined = $false
+            Kind = $kind
+            UsedFallback = ($kind -eq 'Junction' -and $LinkType -eq 'Auto')
+            SymlinkFailure = $symlinkFailure
+            Failures = @()
         }
     }
-    Exit-Install @(
-        "Could not link $Path -> $Target"
-        $failures
-        'On Windows, enable Developer Mode (Settings > System > For developers) or run from an elevated shell' +
-        ' to allow symbolic links.'
-    )
+    return [pscustomobject]@{
+        Path = $Path; Created = $false; Declined = $false; SymlinkFailure = $symlinkFailure; Failures = $failures
+    }
 }
 
 $RepoRoot = Get-PhysicalPath -Path (Join-Path -Path $PSScriptRoot -ChildPath '..')
+
+# An empty environment variable means "not set", as in install.sh and Hermes. An explicitly
+# passed blank value is almost always an empty script variable, and silently falling back to
+# the default home or profile would install somewhere the caller did not ask for.
+foreach ($name in 'HermesHome', 'HermesProfile') {
+    if ($PSBoundParameters.ContainsKey($name) -and [string]::IsNullOrWhiteSpace($PSBoundParameters[$name])) {
+        Exit-Install @(
+            "-$name was passed an empty value."
+            "Omit -$name to use the default, or pass a value."
+        )
+    }
+}
 
 if ([string]::IsNullOrWhiteSpace($HermesHome)) {
     $HermesHomeDir = Get-DefaultHermesHome
@@ -257,16 +307,22 @@ else {
     $HermesHomeDir = Expand-HermesHome $HermesHome
     # A relative or half-expanded home would be resolved against this shell's directory, not
     # wherever Hermes runs, and the install would quietly land where Hermes never looks.
+    # Messages echo the value as given, not the expansion, so no other variable's value is printed.
     if ([regex]::IsMatch($HermesHomeDir, $VariableReference)) {
         Exit-Install @(
-            "HERMES_HOME still refers to an undefined variable after expansion: $HermesHomeDir"
+            "HERMES_HOME still refers to an undefined variable after expansion: $HermesHome"
             'Define the variable, or pass a full path to -HermesHome.'
         )
     }
-    if (-not [IO.Path]::IsPathFullyQualified($HermesHomeDir)) {
+    # IsPathFullyQualified also accepts device paths (\\?\, \\.\) and even \?\x, which
+    # GetFullPath turns into C:\?\x; only a drive root or a UNC share is a real home.
+    $homeRoot = [IO.Path]::GetPathRoot($HermesHomeDir)
+    $realRoot = if ($IsWindows) { '^([A-Za-z]:[\\/]|\\\\[^\\?.][^\\]*\\[^\\]+)$' } else { '^/$' }
+    $isFullPath = [IO.Path]::IsPathFullyQualified($HermesHomeDir) -and $homeRoot -match $realRoot
+    if (-not $isFullPath) {
         Exit-Install @(
-            "HERMES_HOME must be a full path (for example C:\Users\you\hermes), got: $HermesHomeDir"
-            'Relative paths and drive-relative paths such as C:hermes are refused.'
+            "HERMES_HOME must be a full path (for example C:\Users\you\hermes), got: $HermesHome"
+            'Relative paths, drive-relative paths such as C:hermes, and device paths such as \\?\ are refused.'
         )
     }
 }
@@ -276,8 +332,10 @@ $TargetRoot = $HermesHomeDir
 # Like install.sh's [[ -n "$HERMES_PROFILE" ]]: any non-empty value selects a profile.
 if ($HermesProfile.Length -gt 0) {
     # `hermes -p` trims and casefolds the name, then accepts only _PROFILE_NAME_RE
-    # (hermes_cli/main.py). Validating also matters for safety: Path.Combine silently drops the
-    # home for a rooted value such as D:\x or \\host\share.
+    # (hermes_cli/main.py). Lowercasing gives the same result for every ASCII name; a
+    # non-ASCII name that casefolds to ASCII (a sharp s becomes ss) is refused instead, which
+    # is the safe direction. Validating also matters for safety: Path.Combine silently drops
+    # the home for a rooted value such as D:\x or \\host\share.
     $profileName = $HermesProfile.Trim().ToLowerInvariant()
     if ($profileName -cnotmatch $ProfileNamePattern) {
         Exit-Install @(
@@ -347,17 +405,28 @@ if (Test-Path -LiteralPath $ConfigFile -PathType Leaf) {
         # install.sh's grep reports the read error on stderr and the install goes on without
         # legacy-config detection; do the same rather than refusing an install it allows.
         [Console]::Error.WriteLine("install.ps1: ${ConfigFile}: $($_.Exception.Message)")
+        [Console]::Error.WriteLine(
+            'install.ps1: could not check it for the pre-0.24 name hermes-lcm or context.engine: lcm;' +
+            ' if it uses either, follow "Migrate from hermes-lcm" in docs/operator-guide.md.')
     }
 }
 
 Assert-LinkTargetFree -Label plugin -Target $PluginTarget -Expected $RepoRoot
 Assert-LinkTargetFree -Label skill -Target $SkillTarget -Expected $SkillSourcePhysical
 
+# Every change below asks ShouldProcess here, at script scope, so -WhatIf lists it and a
+# "Yes to All" at one -Confirm prompt carries over to the rest.
+$CreatedPaths = [System.Collections.Generic.List[string]]::new()
+$DeclinedPaths = [System.Collections.Generic.List[string]]::new()
 foreach ($parent in @((Split-Path -Parent $PluginTarget), (Split-Path -Parent $SkillTarget))) {
-    if (-not (Test-Path -LiteralPath $parent -PathType Container) -and
-        $PSCmdlet.ShouldProcess($parent, 'Create directory')) {
+    if (Test-Path -LiteralPath $parent -PathType Container) { continue }
+    if ($PSCmdlet.ShouldProcess($parent, 'Create directory')) {
         # Like mkdir -p: creates every missing parent and treats the path literally.
         [void][IO.Directory]::CreateDirectory($parent)
+        $CreatedPaths.Add($parent)
+    }
+    elseif (-not $WhatIfPreference) {
+        $DeclinedPaths.Add($parent)
     }
 }
 
@@ -365,10 +434,42 @@ $CreatedLinks = [System.Collections.Generic.List[object]]::new()
 foreach ($link in @(
         @{ Path = $PluginTarget; Target = $RepoRoot },
         @{ Path = $SkillTarget; Target = $SkillSource })) {
-    if (-not (Test-PathOrLink $link.Path)) {
-        $created = New-DirectoryLink -Path $link.Path -Target $link.Target -LinkType $LinkType
-        if ($created) { $CreatedLinks.Add($created) }
+    if (Test-PathOrLink $link.Path) { continue }
+    $declinedParent = $DeclinedPaths -contains (Split-Path -Parent $link.Path)
+    if ($declinedParent -or -not $PSCmdlet.ShouldProcess($link.Path, "Create link to $($link.Target)")) {
+        # New-Item would create a declined parent directory on its own, so skip the link too.
+        if (-not $WhatIfPreference) { $DeclinedPaths.Add($link.Path) }
+        continue
     }
+    $result = New-DirectoryLink -Path $link.Path -Target $link.Target -LinkType $LinkType -Confirm:$false
+    if ($result.Created) {
+        $CreatedLinks.Add($result)
+        $CreatedPaths.Add($result.Path)
+        continue
+    }
+    $failure = [System.Collections.Generic.List[string]]::new()
+    $failure.Add("Could not link $($link.Path) -> $($link.Target)")
+    $failure.AddRange([string[]]@($result.Failures))
+    if ($result.SymlinkFailure) {
+        $failure.Add('On Windows, enable Developer Mode (Settings > System > For developers) or run from an' +
+            ' elevated shell to allow symbolic links.')
+    }
+    if ($CreatedPaths.Count -gt 0) {
+        $failure.Add('Created before the failure and left in place:')
+        $CreatedPaths | ForEach-Object { $failure.Add("  $_") }
+    }
+    Exit-Install $failure.ToArray()
+}
+
+if ($DeclinedPaths.Count -gt 0) {
+    $cancelled = [System.Collections.Generic.List[string]]::new()
+    $cancelled.Add('Install cancelled at a confirmation prompt. Not created:')
+    $DeclinedPaths | ForEach-Object { $cancelled.Add("  $_") }
+    if ($CreatedPaths.Count -gt 0) {
+        $cancelled.Add('Created before cancelling and left in place:')
+        $CreatedPaths | ForEach-Object { $cancelled.Add("  $_") }
+    }
+    Exit-Install $cancelled.ToArray()
 }
 
 if (-not $WhatIfPreference) {

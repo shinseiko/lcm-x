@@ -19,18 +19,16 @@ which on Windows can be the WSL launcher.
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
-import hashlib
 import os
 import re
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
 
 import pytest
 
-from tests.test_install_ps1 import PWSH, _clean_env, _is_link, _remove_links
+from tests.test_install_ps1 import PWSH, _clean_env, _remove_links, _snapshot
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
@@ -52,7 +50,9 @@ ALLOWED_ADAPTATIONS = {
 def _find_bash() -> str | None:
     explicit = os.environ.get("LCMX_BASH")
     if explicit:
-        return explicit if Path(explicit).is_file() else None
+        # System32\bash.exe and the WindowsApps alias are WSL launchers, not a bash to test with.
+        launcher = re.search(r"[\\/](system32|sysnative|windowsapps)[\\/]", explicit, re.IGNORECASE)
+        return explicit if Path(explicit).is_file() and not launcher else None
     if sys.platform != "win32":
         return None
     for base in (os.environ.get("ProgramW6432"), os.environ.get("ProgramFiles"), r"C:\Program Files"):
@@ -292,30 +292,6 @@ def _run_locked(kind: str, fixture: Fixture) -> Run:
             msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, size)
 
 
-def _snapshot(root: Path) -> dict[str, str]:
-    """Every entry under root: links by where they resolve, files by content hash."""
-    entries: dict[str, str] = {}
-
-    def walk(directory: Path) -> None:
-        for entry in sorted(os.scandir(directory), key=lambda e: e.name):
-            path = Path(entry.path)
-            relative = path.relative_to(root).as_posix()
-            if _is_link(path):
-                resolved = Path(os.path.realpath(path))
-                try:
-                    entries[relative] = "link -> " + resolved.relative_to(root).as_posix()
-                except ValueError:
-                    entries[relative] = "link -> outside: " + str(resolved)
-            elif stat.S_ISDIR(entry.stat(follow_symlinks=False).st_mode):
-                entries[relative] = "dir"
-                walk(path)
-            else:
-                entries[relative] = "file " + hashlib.sha256(path.read_bytes()).hexdigest()[:16]
-
-    walk(root)
-    return entries
-
-
 def _normalize(text: str, root: Path) -> str:
     text = text.replace("\r\n", "\n")  # line endings
     text = text.replace("\\", "/")  # path separators
@@ -330,6 +306,17 @@ def _normalize(text: str, root: Path) -> str:
 def roots(tmp_path):
     # Resolved, so %TEMP%'s 8.3 short name does not make the two scripts print different spellings.
     base = tmp_path.resolve()
+    # Symlinks fail on long paths (MAX_PATH) even with the privilege, and install.ps1 would then
+    # fall back to a junction by design. Probe at the deepest path a scenario uses.
+    probe = base / "ps1" / "home" / "profiles" / "work" / "plugins" / "hermes-lcm-x.install-000000000000"
+    probe.parent.mkdir(parents=True)
+    try:
+        os.symlink(base, probe, target_is_directory=True)
+        os.rmdir(probe)
+    except OSError as exc:
+        pytest.skip(f"cannot create a symlink at this path length ({len(str(probe))}): {exc}")
+    finally:
+        shutil.rmtree(base / "ps1")
     yield base / "sh", base / "ps1"
     _remove_links(tmp_path)
 

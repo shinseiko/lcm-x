@@ -7,6 +7,7 @@ test_packaging_install.py covers. The syntax test runs wherever ``pwsh`` exists.
 """
 
 from pathlib import Path
+import hashlib
 import os
 import shutil
 import stat
@@ -112,10 +113,12 @@ def _install_utf8(hermes_home: Path):
         "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false);"
         "& $env:LCMX_SCRIPT -HermesHome $env:LCMX_HOME"
     )
+    env = _clean_env(LCMX_SCRIPT=str(INSTALL_PS1), LCMX_HOME=str(hermes_home))
+    _assert_sandboxed(("-HermesHome", env["LCMX_HOME"]), env)
     return subprocess.run(
         [PWSH, "-NoProfile", "-NonInteractive", "-Command", command],
         cwd=tempfile.gettempdir(),
-        env=_clean_env(LCMX_SCRIPT=str(INSTALL_PS1), LCMX_HOME=str(hermes_home)),
+        env=env,
         check=False,
         capture_output=True,
         text=True,
@@ -361,6 +364,8 @@ def test_install_reuses_link_spelled_with_different_case(tmp_path, hermes_home):
 @windows_pwsh_only
 def test_install_treats_two_routes_to_one_checkout_as_the_same_copy(tmp_path, hermes_home):
     alias = tmp_path / "alias-to-checkout"
+    if len(str(alias)) > 240:
+        pytest.skip("the working directory would exceed MAX_PATH; use a shorter --basetemp")
     _make_junction(alias, REPO_ROOT)
     assert _install(hermes_home).returncode == 0
 
@@ -491,7 +496,7 @@ def test_install_fails_clearly_when_bundled_skill_is_missing(hermes_home, tmp_pa
 @windows_pwsh_only
 @pytest.mark.parametrize(
     "profile",
-    ["D:\\evil", "\\\\host\\share", "..\\..\\x", "a/b", "-x", "_x", "a b", "x" * 65, "C:x", "   "],
+    ["D:\\evil", "\\\\host\\share", "..\\..\\x", "a/b", "-x", "_x", "a b", "x" * 65, "C:x", "Stra\u00dfe"],
 )
 def test_install_rejects_profile_names_hermes_would_not_accept(hermes_home, profile):
     # Path.Combine drops the home for a rooted profile, so this used to install anywhere.
@@ -540,17 +545,54 @@ def test_install_accepts_every_profile_name_hermes_accepts(hermes_home, profile,
         ("%LCMX_NO_SUCH_VARIABLE%\\home", "undefined variable"),
         ("$LCMX_NO_SUCH_VARIABLE\\home", "undefined variable"),
         ("${LCMX_NO_SUCH_VARIABLE}\\home", "undefined variable"),
+        # .NET calls these "fully qualified", but they are device paths, and GetFullPath
+        # turns \?\x into C:\?\x.
+        # {tmp} keeps a regression that accepted them inside the test's own directory.
+        ("\\?\\x", "must be a full path"),
+        ("\\\\?\\{tmp}\\device-home", "must be a full path"),
+        ("\\\\.\\{tmp}\\device-home", "must be a full path"),
     ],
 )
 def test_install_refuses_a_home_hermes_would_not_resolve_the_same_way(tmp_path, home, message):
     working_dir = tmp_path / "cwd"
     working_dir.mkdir()
 
-    result = _run_ps1(INSTALL_PS1, "-HermesHome", home, cwd=working_dir)
+    result = _run_ps1(INSTALL_PS1, "-HermesHome", home.replace("{tmp}", str(tmp_path)), cwd=working_dir)
 
     assert result.returncode != 0
     assert message in result.stderr
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["cwd"], "a refused home must not be created"
     assert list(working_dir.iterdir()) == [], "nothing may be created relative to the working directory"
+
+
+@windows_pwsh_only
+def test_refusal_echoes_the_home_as_given_not_other_variables(tmp_path):
+    env = _clean_env(LCMX_SECRET_TOKEN="hunter2-not-for-logs")
+
+    result = _run_ps1(INSTALL_PS1, "-HermesHome", "$LCMX_SECRET_TOKEN\\%LCMX_NO_SUCH_VARIABLE%", env=env)
+
+    assert result.returncode != 0
+    assert "$LCMX_SECRET_TOKEN\\%LCMX_NO_SUCH_VARIABLE%" in result.stderr
+    assert "hunter2" not in result.stderr + result.stdout
+
+
+@windows_pwsh_only
+@pytest.mark.parametrize("parameter", ["-HermesHome", "-HermesProfile"])
+@pytest.mark.parametrize("value", ["", "   "])
+def test_explicit_blank_parameter_is_refused_instead_of_using_the_default(tmp_path, parameter, value):
+    # An empty script variable passed as -HermesHome must not install into the default home.
+    local_appdata = tmp_path / "local-appdata"
+    env = _clean_env(LOCALAPPDATA=str(local_appdata), HERMES_HOME=str(tmp_path / "env-home"))
+    args = ("-HermesHome", str(tmp_path / "home"), parameter, value) if parameter == "-HermesProfile" else (
+        parameter, value)
+    result = subprocess.run(
+        [PWSH, "-NoProfile", "-NonInteractive", "-File", str(INSTALL_PS1), *args],
+        cwd=tempfile.gettempdir(), env=env, check=False, capture_output=True, text=True, encoding="utf-8",
+    )
+
+    assert result.returncode == 1
+    assert f"{parameter} was passed an empty value." in result.stderr
+    assert list(tmp_path.iterdir()) == [], "nothing may be created"
 
 
 @windows_pwsh_only
@@ -579,19 +621,23 @@ function New-Item {
     if ($ItemType -eq 'SymbolicLink') { throw 'simulated: symbolic links are not permitted' }
     Microsoft.PowerShell.Management\New-Item -ItemType $ItemType -Path $Path -Value $Target -ErrorAction Stop
 }
-$result = New-DirectoryLink -Path $Link -Target $Target -LinkType $LinkType
-"KIND=$($result.Kind)"
-"FALLBACK=$($result.UsedFallback)"
+$result = New-DirectoryLink -Path $Link -Target $Target -LinkType $LinkType -Confirm:$false
+"CREATED=$($result.Created)"
+"KIND=$(if ($result.Created) { $result.Kind })"
+"FALLBACK=$(if ($result.Created) { $result.UsedFallback })"
 "REASON=$($result.SymlinkFailure)"
+"FAILURES=$($result.Failures -join ' | ')"
 """
 
 
-def _run_fallback_harness(tmp_path: Path, link_type: str):
+def _run_fallback_harness(tmp_path: Path, link_type: str, existing_empty_dir: bool = False):
     harness = tmp_path / "harness.ps1"
     harness.write_text(FALLBACK_HARNESS, encoding="utf-8")
     target = tmp_path / "target"
     target.mkdir()
     link = tmp_path / "link"
+    if existing_empty_dir:
+        link.mkdir()
     result = subprocess.run(
         [PWSH, "-NoProfile", "-NonInteractive", "-File", str(harness),
          "-ScriptPath", str(INSTALL_PS1), "-Link", str(link), "-Target", str(target), "-LinkType", link_type],
@@ -622,16 +668,132 @@ def test_forced_symbolic_link_does_not_fall_back(tmp_path):
     try:
         result, link, _ = _run_fallback_harness(tmp_path, "SymbolicLink")
 
-        assert result.returncode != 0
-        assert "Could not link" in result.stderr
-        assert "simulated: symbolic links are not permitted" in result.stderr
+        assert result.returncode == 0, result.stderr
+        assert "CREATED=False" in result.stdout
+        assert "FAILURES=SymbolicLink: simulated: symbolic links are not permitted" in result.stdout
         assert not os.path.lexists(link)
+        assert [p.name for p in tmp_path.iterdir() if p.name.startswith("link")] == []
     finally:
         _remove_links(tmp_path)
 
 
-def _snapshot(root: Path) -> list[str]:
-    return sorted(str(p.relative_to(root)) for p in root.rglob("*")) if root.exists() else []
+@windows_pwsh_only
+@pytest.mark.parametrize("link_type", ["Auto", "Junction"])
+def test_link_creation_never_replaces_an_empty_directory_that_appeared(tmp_path, link_type):
+    # New-Item -ItemType Junction silently replaces an empty directory. A directory that appears
+    # after the preflight (another process, a second installer) must survive untouched.
+    try:
+        result, link, _ = _run_fallback_harness(tmp_path, link_type, existing_empty_dir=True)
+
+        assert result.returncode == 0, result.stderr
+        assert "CREATED=False" in result.stdout
+        assert link.is_dir() and not _is_link(link)
+        leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith("link.install-")]
+        assert leftovers == [], "the staging link must be removed"
+    finally:
+        _remove_links(tmp_path)
+
+
+@windows_pwsh_only
+def test_hard_linked_file_at_the_target_is_a_path_not_a_link(tmp_path, hermes_home):
+    original = tmp_path / "some-file"
+    original.write_text("x", encoding="utf-8")
+    target = hermes_home / "plugins" / "hermes-lcm-x"
+    target.parent.mkdir(parents=True)
+    os.link(original, target)
+
+    result = _install(hermes_home)
+
+    assert result.returncode == 1
+    # install.sh's [[ -L ]] is false for a hard link, so it says "path".
+    assert result.stderr.splitlines() == [
+        f"Refusing to replace existing path: {target}",
+        "Move it aside or remove it manually before rerunning install.ps1.",
+    ]
+
+
+@windows_pwsh_only
+def test_install_runs_from_a_non_file_system_location(hermes_home):
+    command = "Set-Location HKCU:\\; & $env:LCMX_SCRIPT -HermesHome $env:LCMX_HOME; exit $LASTEXITCODE"
+    env = _clean_env(LCMX_SCRIPT=str(INSTALL_PS1), LCMX_HOME=str(hermes_home))
+    _assert_sandboxed(("-HermesHome", env["LCMX_HOME"]), env)
+
+    result = subprocess.run(
+        [PWSH, "-NoProfile", "-NonInteractive", "-Command", command],
+        cwd=tempfile.gettempdir(), env=env, check=False, capture_output=True, text=True, encoding="utf-8",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (hermes_home / "plugins" / "hermes-lcm-x").resolve() == REPO_ROOT.resolve()
+
+
+def _install_confirm(hermes_home: Path, answers: str):
+    # Interactive -Confirm: answers are read from stdin, one per prompt.
+    _assert_sandboxed(("-HermesHome", str(hermes_home)), _clean_env())
+    return subprocess.run(
+        [PWSH, "-NoProfile", "-File", str(INSTALL_PS1), "-HermesHome", str(hermes_home), "-Confirm"],
+        input=answers, cwd=tempfile.gettempdir(), env=_clean_env(), check=False,
+        capture_output=True, text=True, encoding="utf-8",
+    )
+
+
+@windows_pwsh_only
+def test_confirm_declining_the_directories_creates_nothing(hermes_home):
+    result = _install_confirm(hermes_home, "n\nn\n")
+
+    assert result.returncode == 1
+    assert "Install cancelled at a confirmation prompt. Not created:" in result.stderr
+    assert str(hermes_home / "plugins" / "hermes-lcm-x") in result.stderr
+    assert not hermes_home.exists(), "a declined parent must not be created by the link step"
+
+
+@windows_pwsh_only
+def test_confirm_declining_the_links_reports_what_was_created(hermes_home):
+    result = _install_confirm(hermes_home, "y\ny\nn\nn\n")
+
+    assert result.returncode == 1
+    assert "Created before cancelling and left in place:" in result.stderr
+    assert str(hermes_home / "plugins") in result.stderr
+    assert not (hermes_home / "plugins" / "hermes-lcm-x").exists()
+    assert "Installed hermes-lcm-x" not in result.stdout
+
+
+@windows_pwsh_only
+def test_confirm_yes_to_all_covers_every_change(hermes_home):
+    result = _install_confirm(hermes_home, "a\n")
+
+    assert result.returncode == 0, result.stderr
+    assert (hermes_home / "skills" / "hermes-lcm-x").resolve() == (REPO_ROOT / "skills" / "hermes-lcm").resolve()
+
+
+def _snapshot(root: Path) -> dict[str, str]:
+    """Every entry under root: links by where they resolve, files by content hash.
+
+    Walks with scandir and never descends into a link or junction (Path.rglob follows
+    junctions, which would walk the whole checkout these links point at).
+    """
+    entries: dict[str, str] = {}
+    if not root.exists():
+        return entries
+
+    def walk(directory: Path) -> None:
+        for entry in sorted(os.scandir(directory), key=lambda e: e.name):
+            path = Path(entry.path)
+            relative = path.relative_to(root).as_posix()
+            if _is_link(path):
+                resolved = Path(os.path.realpath(path))
+                try:
+                    entries[relative] = "link -> " + resolved.relative_to(root).as_posix()
+                except ValueError:
+                    entries[relative] = "link -> outside: " + str(resolved)
+            elif stat.S_ISDIR(entry.stat(follow_symlinks=False).st_mode):
+                entries[relative] = "dir"
+                walk(path)
+            else:
+                entries[relative] = "file " + hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+
+    walk(root)
+    return entries
 
 
 @windows_pwsh_only
@@ -717,6 +879,8 @@ def test_unreadable_config_is_reported_but_does_not_block_the_install(hermes_hom
 
     assert result.returncode == 0, result.stderr
     assert f"install.ps1: {config}: " in result.stderr
+    assert "could not check it for the pre-0.24 name hermes-lcm" in result.stderr
+    assert 'follow "Migrate from hermes-lcm" in docs/operator-guide.md' in result.stderr
     assert (hermes_home / "plugins" / "hermes-lcm-x").resolve() == REPO_ROOT.resolve()
     assert "MIGRATION" not in result.stdout, "an unreadable config cannot be classified as legacy"
 
