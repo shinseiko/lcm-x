@@ -222,10 +222,14 @@ git clone https://github.com/electricsheephq/lcm-x "$env:LOCALAPPDATA\hermes\plu
 migration output, and it never edits `config.yaml` or deletes anything. It creates
 symbolic links, and falls back to directory junctions when symbolic links are not
 permitted (turn on Windows Developer Mode to allow them); Hermes follows both. It
-also accepts `-HermesHome <full path>` and `-LinkType Auto|SymbolicLink|Junction`.
-`HERMES_HOME` may use `~`, `$VAR`, `${VAR}` or `%VAR%` as Hermes does, but a relative or
-half-expanded path is refused, and a profile must be a valid Hermes profile name
-(lowercase letters, digits, `_` and `-`).
+also accepts `-HermesHome <full path>`, `-LinkType Auto|SymbolicLink|Junction`, and
+`-WhatIf` to preview the install without creating anything (`Get-Help
+.\scripts\install.ps1 -Full` lists every option). `HERMES_HOME` may use `~`, `$VAR`,
+`${VAR}` or `%VAR%` as Hermes does, but a relative or half-expanded path is refused. A
+profile name is trimmed and lowercased as `hermes -p` does and must then be a valid
+Hermes profile name (lowercase letters, digits, `_` and `-`). The deliberate
+differences from `install.sh` are listed in the
+[operator guide](docs/operator-guide.md#windows-installer).
 
 Run `scripts/install.sh` (or `scripts\install.ps1`) even when the checkout already lives at the canonical
 plugin path. It leaves that checkout in place and exposes the bundled

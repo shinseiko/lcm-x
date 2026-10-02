@@ -42,7 +42,13 @@ On Windows (PowerShell 7.2+), use the equivalent `install.ps1`; Hermes' home is
 ```powershell
 .\scripts\install.ps1
 .\scripts\install.ps1 -HermesProfile myprofile
+.\scripts\install.ps1 -HermesProfile myprofile -WhatIf   # preview only
 ```
+
+A profile name is trimmed and lowercased as `hermes -p` does and must be a valid Hermes
+profile name. `install.ps1` uses symbolic links, or directory junctions where symbolic
+links are not permitted; its deliberate differences from `install.sh` are listed in
+`docs/operator-guide.md` ("Windows installer").
 
 The installer exposes both:
 

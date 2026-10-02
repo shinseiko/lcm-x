@@ -35,19 +35,6 @@ From an existing checkout, install a symlink:
 HERMES_PROFILE=myprofile ./scripts/install.sh
 ```
 
-On Windows, run the PowerShell 7.2+ port from the checkout. Hermes' home is
-`%LOCALAPPDATA%\hermes` unless `HERMES_HOME` is set:
-
-```powershell
-.\scripts\install.ps1
-# Optional profile-aware install:
-.\scripts\install.ps1 -HermesProfile myprofile
-```
-
-`install.ps1` links with symbolic links and falls back to directory junctions when
-symbolic links are not permitted (Windows Developer Mode allows them); Hermes follows
-both. It has the same preflight, refusals, and migration output as `install.sh`.
-
 The installer exposes both the plugin checkout and the bundled
 `skills/hermes-lcm` package in the matching global/profile skill tree. It is
 safe to run from a checkout already cloned into the canonical plugin path and
@@ -56,6 +43,41 @@ finds a pre-0.24 install (`plugins/hermes-lcm`, or a `config.yaml` that enables
 `hermes-lcm` / selects `context.engine: lcm`) it prints the migration steps in
 [Migrate from hermes-lcm](#migrate-from-hermes-lcm-v023x-and-earlier); it never
 edits `config.yaml` and never deletes the old directory.
+
+### Windows installer
+
+On Windows, run the PowerShell 7.2+ workalike from the checkout. Hermes' home is
+`%LOCALAPPDATA%\hermes` unless `HERMES_HOME` is set:
+
+```powershell
+.\scripts\install.ps1
+# Optional profile-aware install:
+.\scripts\install.ps1 -HermesProfile myprofile
+# Preview: run the preflight and list what would be created, creating nothing:
+.\scripts\install.ps1 -HermesProfile myprofile -WhatIf
+```
+
+`install.ps1` links with symbolic links and falls back to directory junctions when
+symbolic links are not permitted (Windows Developer Mode allows them); Hermes follows
+both. It has the same preflight, refusals, and activation/migration output as
+`install.sh`, and it never edits `config.yaml` or deletes anything.
+`tests/test_install_parity.py` runs both scripts on the same scenarios and checks that.
+To link several profiles to one checkout, run it once per profile; one `git pull` then
+updates every profile.
+
+Intentional differences from `install.sh`:
+
+| Area | `install.sh` | `install.ps1` | Why |
+|---|---|---|---|
+| Default home | `$HOME/.hermes` | `%LOCALAPPDATA%\hermes` (plus `HERMES_DATA_DIR_SUFFIX`) | Hermes' own default on Windows |
+| `HERMES_HOME` | used as written | `~`, `$VAR`, `${VAR}`, `%VAR%` expanded; relative, drive-relative (`C:x`) or still-unexpanded values refused | Hermes expands it the same way and would resolve a relative path against its own working directory, not yours |
+| Profile name | any string | trimmed and lowercased, then must match `^[a-z0-9][a-z0-9_-]{0,63}$` | Hermes' `-p` rule; a rooted value such as `D:\x` would otherwise install outside the home |
+| Link kind | symlink | symlink, else a directory junction (`Note:` says why) | Symlinks need Developer Mode or elevation and paths under 260 characters |
+| Refusal noun | `symlink` | `symlink` or `junction`, whichever it is | Names the actual link |
+| Path identity | exact string compare after `pwd -P` | every link and junction resolved, case-insensitive | Windows paths are case-insensitive |
+| Unreadable `config.yaml` | `grep:` error, install continues | `install.ps1:` error, install continues | Same behavior; the message comes from a different tool |
+| Extras | none | `-WhatIf`/`-Confirm`, `-LinkType`, `Get-Help`; refuses a checkout without its bundled skill; re-checks both links after creating them | PowerShell conventions and additive safety checks |
+| Runtime | bash | PowerShell 7.2+ | `ResolveLinkTarget` needs .NET 6 |
 
 ## Activate
 
