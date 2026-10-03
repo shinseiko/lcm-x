@@ -68,6 +68,21 @@ parses and that its help renders.
 To link several profiles to one checkout, run it once per profile; one `git pull` then
 updates every profile.
 
+Hermes loads plugins only from the active profile's own `plugins` directory, and
+`hermes profile create --clone` copies `config.yaml` and skills (links included) but not
+`plugins`. A clone of a profile that uses LCM-X therefore has `context.engine: lcm-x` without
+the plugin, and Hermes falls back to its built-in compressor. Link the plugin into every new
+profile right after creating it:
+
+```powershell
+hermes profile create work --clone
+.\scripts\install.ps1 -HermesProfile work
+```
+
+The same applies on POSIX (`HERMES_PROFILE=work ./scripts/install.sh`). A profile created
+without `--clone` also needs `plugins.enabled: [hermes-lcm-x]` and `context.engine: lcm-x` in
+its `config.yaml`; the installer prints both lines and never edits the config.
+
 Intentional differences from `install.sh`:
 
 | Area | `install.sh` | `install.ps1` | Why |
